@@ -1,0 +1,33 @@
+name: Kitamura used-lens monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */2 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+      - name: Check used listings
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+      - name: Save notified listing IDs
+        run: |
+          git config user.name 'kitamura-monitor[bot]'
+          git config user.email 'kitamura-monitor[bot]@users.noreply.github.com'
+          git add database.json
+          git diff --cached --quiet || git commit -m 'Update monitored used listings'
+          git push

@@ -148,7 +148,12 @@ def send_discord(listing):
 
 def main():
     database = load_database()
-    current = list(fetch_listings()) + list(fetch_mapcamera_listings())
+    current = list(fetch_listings())
+    try:
+        current += list(fetch_mapcamera_listings())
+    except Exception as error:
+        # Never let a temporary MapCamera access block stop Kitamura monitoring.
+        print(f"MapCamera確認失敗: {error}", file=sys.stderr)
     current_by_id = {item["id"]: item for item in current}
 
     if not database.get("initialized", False):

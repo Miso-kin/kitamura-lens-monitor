@@ -69,8 +69,11 @@ def fetch_listings():
     # GitHub ActionsからAPIを直呼びすると403になるため、実際の検索画面と
     # 同じブラウザ経路で読み込み、その画面が受け取った中古検索データを使う。
     responses = []
+    observed_api_responses = []
 
     def collect(response):
+        if "/api/" in response.url:
+            observed_api_responses.append((response.status, response.url))
         if "/ec/api/cache/" in response.url and (
             "used_sell_search" in response.url or "/vvc/u/" in response.url
         ):
@@ -100,7 +103,8 @@ def fetch_listings():
 
     if payload is None:
         detail = f"（HTTP {failure_status}）" if failure_status else ""
-        raise RuntimeError(f"中古検索データを取得できませんでした{detail}")
+        observed = " | ".join(f"{status} {url}" for status, url in observed_api_responses[-10:])
+        raise RuntimeError(f"中古検索データを取得できませんでした{detail}; API応答: {observed or 'なし'}")
 
     return {
         listing["id"]: listing

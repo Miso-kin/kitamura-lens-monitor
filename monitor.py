@@ -6,12 +6,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from playwright.sync_api import sync_playwright
 
 PRODUCT_NAME = "キヤノン RF100-300mm F2.8 L IS USM"
 JAN_CODE = "4549292216165"
 LIST_URL = f"https://shop.kitamura.jp/ec/list?keyword3={JAN_CODE}&type=u"
+USED_API_URL = "https://shop.kitamura.jp/ec/api/cache/vvc/u/v1/list"
 DB_PATH = Path("database.json")
+BROWSER_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ja-JP,ja;q=0.9",
+    "Referer": LIST_URL,
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+    ),
+}
 
 
 def clean(value):
@@ -25,10 +34,7 @@ def load_database():
 
 
 def save_database(database):
-    DB_PATH.write_text(
-        json.dumps(database, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    DB_PATH.write_text(json.dumps(database, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def format_price(value):
@@ -39,107 +45,67 @@ def format_price(value):
 
 
 def extract_accessories(description):
-    # キタムラの中古検索データでは、付属品は商品説明の冒頭に記載される。
     first_sentence = clean(description).split("。", 1)[0]
-    if "付" in first_sentence:
-        return first_sentence
-    return "商品説明に記載なし"
+    return first_sentence if "付" in first_sentence else "商品説明に記載なし"
 
 
 def listing_from_api_item(item):
     item_id = clean(item.get("itemid"))
     if not item_id:
         raise RuntimeError("中古検索データに商品IDがありません")
-
     description = clean(item.get("description"))
     return {
         "id": item_id,
         "url": clean(item.get("title_link")) or LIST_URL,
         "title": clean(item.get("title")) or PRODUCT_NAME,
         "price": format_price(item.get("price")),
-        # ランク専用フィールドがない場合は推測せず、説明欄をそのまま通知する。
-        "condition": clean(item.get("condition") or item.get("rank"))
-        or "商品説明に記載なし",
+        "condition": clean(item.get("condition") or item.get("rank")) or "商品説明に記載なし",
         "accessories": extract_accessories(description),
         "remarks": description or "記載なし",
     }
 
 
 def fetch_listings():
-    # GitHub ActionsからAPIを直呼びすると403になるため、実際の検索画面と
-    # 同じブラウザ経路で読み込み、その画面が受け取った中古検索データを使う。
-    responses = []
-    observed_api_responses = []
-
-    def collect(response):
-        if "/api/" in response.url:
-            observed_api_responses.append((response.status, response.url))
-        if "/ec/api/cache/" in response.url and (
-            "used_sell_search" in response.url or "/vvc/u/" in response.url
-        ):
-            responses.append(response)
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page(locale="ja-JP")
-        page.on("response", collect)
-        page.goto(LIST_URL, wait_until="networkidle", timeout=90000)
-        page.wait_for_timeout(2000)
-
-        payload = None
-        failure_status = None
-        for response in reversed(responses):
-            if response.status != 200:
-                failure_status = response.status
-                continue
-            try:
-                candidate = response.json()
-            except Exception:
-                continue
-            if isinstance(candidate, dict) and isinstance(candidate.get("items"), list):
-                payload = candidate
-                break
-        browser.close()
-
-    if payload is None:
-        detail = f"（HTTP {failure_status}）" if failure_status else ""
-        observed = " | ".join(f"{status} {url}" for status, url in observed_api_responses[-10:])
-        raise RuntimeError(f"中古検索データを取得できませんでした{detail}; API応答: {observed or 'なし'}")
-
-    return {
-        listing["id"]: listing
-        for listing in map(listing_from_api_item, payload["items"])
-    }.values()
+    response = requests.get(
+        USED_API_URL,
+        params={"keyword3": JAN_CODE, "sort": "newer", "ipg": 100, "page": 1},
+        headers=BROWSER_HEADERS,
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"中古検索データの取得が拒否されました（HTTP {response.status_code}）")
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError("中古検索データがJSONではありません") from error
+    if not isinstance(payload.get("items"), list):
+        raise RuntimeError("中古検索データの応答形式が想定外です")
+    return {listing["id"]: listing for listing in map(listing_from_api_item, payload["items"])}.values()
 
 
 def send_discord(listing):
-    webhook = os.environ["DISCORD_WEBHOOK_URL"]
-    fields = [
-        {"name": "価格", "value": listing["price"], "inline": True},
-        {"name": "状態", "value": listing["condition"][:1024], "inline": True},
-        {"name": "付属品", "value": listing["accessories"][:1024], "inline": False},
-        {"name": "備考", "value": listing["remarks"][:1024], "inline": False},
-    ]
     payload = {
-        "embeds": [
-            {
-                "title": "中古在庫を検出しました",
-                "description": listing["title"],
-                "url": listing["url"],
-                "color": 0xE53935,
-                "fields": fields,
-                "footer": {"text": "カメラのキタムラ オンラインショップ"},
-            }
-        ]
+        "embeds": [{
+            "title": "中古在庫を検出しました",
+            "description": listing["title"],
+            "url": listing["url"],
+            "color": 0xE53935,
+            "fields": [
+                {"name": "価格", "value": listing["price"], "inline": True},
+                {"name": "状態", "value": listing["condition"][:1024], "inline": True},
+                {"name": "付属品", "value": listing["accessories"][:1024], "inline": False},
+                {"name": "備考", "value": listing["remarks"][:1024], "inline": False},
+            ],
+            "footer": {"text": "カメラのキタムラ オンラインショップ"},
+        }]
     }
-    response = requests.post(webhook, json=payload, timeout=30)
+    response = requests.post(os.environ["DISCORD_WEBHOOK_URL"], json=payload, timeout=30)
     response.raise_for_status()
 
 
 def main():
     database = load_database()
     current_by_id = {item["id"]: item for item in fetch_listings()}
-
     if not database.get("initialized", False):
         database["initialized"] = True
         database["seen"] = current_by_id
@@ -147,15 +113,10 @@ def main():
         print(f"初回登録: {len(current_by_id)}件（通知なし）")
         return
 
-    new_items = [
-        item
-        for item_id, item in current_by_id.items()
-        if item_id not in database.get("seen", {})
-    ]
+    new_items = [item for item_id, item in current_by_id.items() if item_id not in database.get("seen", {})]
     for item in new_items:
         send_discord(item)
         print(f"通知: {item['id']}")
-
     database["seen"] = {**database.get("seen", {}), **current_by_id}
     database["last_checked_at"] = datetime.now(timezone.utc).isoformat()
     save_database(database)

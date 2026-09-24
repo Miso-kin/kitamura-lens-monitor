@@ -1,4 +1,4 @@
-name: Kitamura used-lens monitor
+name: Kitamura used-lens monitor (disabled; migrated to Google Apps Script)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,6 @@ on:
       - 'monitor.py'
       - 'requirements.txt'
       - '.github/workflows/monitor.yml'
-  schedule:
-    - cron: '17 */2 * * *'
 
 permissions:
   contents: write

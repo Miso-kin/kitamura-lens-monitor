@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from playwright.sync_api import sync_playwright
 
 PRODUCT_NAME = "キヤノン RF100-300mm F2.8 L IS USM"
 JAN_CODE = "4549292216165"
-USED_API_URL = "https://shop.kitamura.jp/ec/api/cache/vvc/u/v1/list"
+LIST_URL = f"https://shop.kitamura.jp/ec/list?keyword3={JAN_CODE}&type=u"
 DB_PATH = Path("database.json")
 
 
@@ -38,7 +39,7 @@ def format_price(value):
 
 
 def extract_accessories(description):
-    # キタムラの中古検索APIでは、付属品は商品説明の冒頭に記載される。
+    # キタムラの中古検索データでは、付属品は商品説明の冒頭に記載される。
     first_sentence = clean(description).split("。", 1)[0]
     if "付" in first_sentence:
         return first_sentence
@@ -48,17 +49,15 @@ def extract_accessories(description):
 def listing_from_api_item(item):
     item_id = clean(item.get("itemid"))
     if not item_id:
-        raise RuntimeError("中古検索APIの在庫データに商品IDがありません")
+        raise RuntimeError("中古検索データに商品IDがありません")
 
     description = clean(item.get("description"))
     return {
         "id": item_id,
-        "url": clean(item.get("title_link"))
-        or f"https://shop.kitamura.jp/ec/list?keyword3={JAN_CODE}&type=u",
+        "url": clean(item.get("title_link")) or LIST_URL,
         "title": clean(item.get("title")) or PRODUCT_NAME,
         "price": format_price(item.get("price")),
-        # 現行APIにはランク専用フィールドがないため、存在しない情報を
-        # 推測せず明示する。商品説明には外観・傷などが含まれる。
+        # ランク専用フィールドがない場合は推測せず、説明欄をそのまま通知する。
         "condition": clean(item.get("condition") or item.get("rank"))
         or "商品説明に記載なし",
         "accessories": extract_accessories(description),
@@ -67,30 +66,46 @@ def listing_from_api_item(item):
 
 
 def fetch_listings():
-    params = {
-        "keyword3": JAN_CODE,
-        "sort": "newer",
-        "ipg": 100,
-        "page": 1,
-    }
-    response = requests.get(
-        USED_API_URL,
-        params=params,
-        timeout=30,
-        headers={"User-Agent": "kitamura-lens-monitor/2.0"},
-    )
-    response.raise_for_status()
+    # GitHub ActionsからAPIを直呼びすると403になるため、実際の検索画面と
+    # 同じブラウザ経路で読み込み、その画面が受け取った中古検索データを使う。
+    responses = []
 
-    try:
-        payload = response.json()
-    except ValueError as error:
-        raise RuntimeError("中古検索APIがJSONを返しませんでした") from error
+    def collect(response):
+        if "/ec/api/cache/" in response.url and (
+            "used_sell_search" in response.url or "/vvc/u/" in response.url
+        ):
+            responses.append(response)
 
-    items = payload.get("items")
-    if not isinstance(items, list):
-        raise RuntimeError("中古検索APIの応答形式が想定外です")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(locale="ja-JP")
+        page.on("response", collect)
+        page.goto(LIST_URL, wait_until="networkidle", timeout=90000)
+        page.wait_for_timeout(2000)
 
-    return {listing["id"]: listing for listing in map(listing_from_api_item, items)}.values()
+        payload = None
+        failure_status = None
+        for response in reversed(responses):
+            if response.status != 200:
+                failure_status = response.status
+                continue
+            try:
+                candidate = response.json()
+            except Exception:
+                continue
+            if isinstance(candidate, dict) and isinstance(candidate.get("items"), list):
+                payload = candidate
+                break
+        browser.close()
+
+    if payload is None:
+        detail = f"（HTTP {failure_status}）" if failure_status else ""
+        raise RuntimeError(f"中古検索データを取得できませんでした{detail}")
+
+    return {
+        listing["id"]: listing
+        for listing in map(listing_from_api_item, payload["items"])
+    }.values()
 
 
 def send_discord(listing):

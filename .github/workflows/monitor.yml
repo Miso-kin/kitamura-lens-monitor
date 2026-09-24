@@ -2,6 +2,11 @@ name: Kitamura used-lens monitor
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'monitor.py'
+      - 'requirements.txt'
+      - '.github/workflows/monitor.yml'
   schedule:
     - cron: '17 */2 * * *'
 
